@@ -1,0 +1,571 @@
+name: daily-build-and-scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+#on:
+#  schedule:
+#    #- cron: "0 0 * * *"
+#    - cron: "*/30 * * * *"
+
+env:
+  CURRENT_VERSION_TAG: "1.0.0"
+  #github.event.repository.name is a special environment variable that gives us the repo name.  There isn't great documentation on it.
+  IMAGE_NAME: ${{ vars.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
+  MITRE_SAF_VERSION: "1.4.22"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3.5.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.11.1
+      -
+        name: Build image
+        uses: docker/build-push-action@v6.18.0
+        with:
+          push: true
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:${{ env.CURRENT_VERSION_TAG }}, ${{ vars.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+
+  scap:
+    needs: build
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
+    env:
+      SCAP_SECURITY_GUIDE_VERSION: "0.1.78"
+      WOLFI_STIG_VERSION: "3.2.5"
+      SSG_DIR: "ssg"
+      TOOL: "openscap"
+      OUTPUT_NAME: "openscap-results"
+    steps:
+      -
+        name: Install prerequisites
+        run: |
+          set -eu
+          apk add curl docker jq openscap-docker npm gcompat unzip git
+          npm install -g "@mitre/saf@${{ env.MITRE_SAF_VERSION }}"
+          mkdir -p "${{ env.SSG_DIR}}"
+          curl "https://github.com/ComplianceAsCode/content/releases/download/v${SCAP_SECURITY_GUIDE_VERSION}/scap-security-guide-${SCAP_SECURITY_GUIDE_VERSION}.zip" -Lso "${SSG_DIR}/ssg.zip"
+          curl "https://github.com/chainguard-dev/stigs/archive/refs/tags/v${WOLFI_STIG_VERSION}.zip" -Lso "${SSG_DIR}/wolfi.zip"
+          unzip "${SSG_DIR}/ssg.zip" -d "${SSG_DIR}"
+          unzip "${SSG_DIR}/wolfi.zip" -d "${SSG_DIR}"
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3.5.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Pull the docker image to scan
+        run: |
+          set -eu
+          docker pull "${IMAGE_NAME}"
+      -
+        name: Run openscap
+        run: |
+          set -eu
+          container_id=$(docker create "${IMAGE_NAME}")
+          if ! docker export "${container_id}" | tar -tvf - | grep -E '\setc/os-release( ->.*)?$' > /dev/null 2>&1 ; then
+            >&2 echo "The operating system used by ${IMAGE_NAME} could not be detected."
+            >&2 echo "Images that are not based on an operating system (such as distroless images) cannot be scanned by SCAP."
+            exit 1
+          fi
+          docker cp -L "$container_id:/etc/os-release" .
+          docker rm "$container_id"
+          unset container_id
+          set +e
+          oscap-docker image "${IMAGE_NAME}" xccdf eval --verbose ERROR --fetch-remote-resources --profile "xccdf_basic_profile_.check" --results "${{ env.OUTPUT_NAME }}.xml" --report "${{ env.OUTPUT_NAME }}.html" "${SSG_DIR}/stigs-${WOLFI_STIG_VERSION}/gpos/xml/scap/ssg/content/ssg-chainguard-gpos-ds.xml"
+          OSCAP_EXIT_CODE=$?
+          set -e
+          case "${OSCAP_EXIT_CODE}" in
+            0)
+              echo "All rules passed"
+            ;;
+            1)
+              >&2 echo "An error occurred during evaluation"
+              exit 2
+            ;;
+            2)
+              echo "There is at least one rule with either fail or unknown result"
+            ;;
+            *)
+              >&2 echo "openscap returned an unexpected exit status of $OSCAP_EXIT_CODE"
+              exit "$OSCAP_EXIT_CODE"
+            ;;
+          esac
+      -
+        name: Make the XCCDF into an HDF file
+        run: |
+          set -eu
+          saf convert xccdf_results2hdf -i ${{ env.OUTPUT_NAME }}.xml -o ${{ env.OUTPUT_NAME }}.hdf.json
+      -
+        name: Make the HDF file into a CSV
+        run: |
+          set -eu
+          saf convert hdf2csv -i ${{ env.OUTPUT_NAME }}.hdf.json -o ${{ env.OUTPUT_NAME }}.csv
+      -
+        name: Upload reports
+        if: success() || failure() # always run even if the previous step fails
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: openscap-results
+          path: |
+            ${{ env.OUTPUT_NAME }}.xml
+            ${{ env.OUTPUT_NAME }}.hdf.json
+            ${{ env.OUTPUT_NAME }}.csv
+      -
+        name: Clone Reporting Repo
+        uses: GuillaumeFalourd/clone-github-repo-action@v2.3
+        with:
+          depth: 1
+          branch: 'main'
+          owner: ${{ secrets.GH_ACCT }}
+          repository: ${{ secrets.GH_REPO }}
+          access-token: ${{ secrets.INTERNAL_PAT }}
+      -
+        name: Create reporting repo if it doesn't exists.
+        run: |
+          if [[ ! -d ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/ ]]; then
+            echo "Project directory does not exist.  Creating."
+            mkdir -p ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/
+            ls -latr ./${{ secrets.GH_REPO }}/
+          else
+            echo "Project directory exists, happy day."
+          fi
+      -
+        name: Modify cloned repository content and commit
+        run: |
+          cp "./${{ env.OUTPUT_NAME }}.csv" "./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/${{ env.OUTPUT_NAME }}.csv"
+          cd ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}
+          git config --global user.email ${{ secrets.GH_EMAIL }}
+          git config --global user.name ${{ secrets.GH_NAME }}
+          git add "${{ env.OUTPUT_NAME }}.csv"
+          git pull
+          git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}" --dry-run > check.txt 2>&1 | true
+          if grep 'nothing added to commit' check.txt; then
+            rm check.txt
+            exit 0
+          else
+            rm check.txt
+            git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}"
+          fi
+      -
+        name: Push to Reporting Repo
+        run: |
+          cd ${{ secrets.GH_REPO }}
+          git remote set-url origin https://x-access-token:${{ secrets.INTERNAL_PAT }}@github.com/${{ secrets.GH_ACCT }}/${{ secrets.GH_REPO }}.git
+          git push
+
+  trufflehog:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      EXPORT_NAME: "build.tar"
+      DIR_NAME: "build"
+      TOOL: "trufflehog"
+      OUTPUT_NAME: "trufflehog-results"
+    steps:
+      -
+        name: Install prerequisites
+        run: |
+          set -eu
+          sudo apt-get install -y npm
+          npm install -g "@mitre/saf@${{ env.MITRE_SAF_VERSION }}"
+          sudo curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sudo sh -s -- -b /usr/local/bin
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3.5.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Create, export, then extract to the filesystem
+        run: |
+          set -eu
+          mkdir -p ${{ env.DIR_NAME }}
+          CONT_ID=$(docker create ${{ env.IMAGE_NAME }})
+          docker export ${CONT_ID} -o ${{ env.EXPORT_NAME }}
+          tar --exclude='dev/null' --exclude='dev/random' --exclude='dev/urandom' --exclude='dev/zero' -xvf ${{ env.EXPORT_NAME }} -C ${{ github.workspace }}/${{ env.DIR_NAME }}
+      -
+        name: Trufflehog scan
+        run: |
+          trufflehog filesystem ${{ github.workspace }}/${{ env.DIR_NAME }} --no-update --only-verified --json --force-skip-archives | grep -wE "\{\"SourceMetadata\":" | jq --slurp . > ${{ env.OUTPUT_NAME }}.json
+      -
+       name: Make the Trufflehog JSON into an HDF file OR make a stub file
+       run: |
+         set -eu
+         if grep -zoP '\[\]' trufflehog-results.json; then
+           echo "NO RESULTS FOUND, CREATING STUB"
+           echo 'Results Set,Status,ID,Title,Description,Descriptions,Impact,Severity,Code,Check,Fix,800-53 Controls,CCI IDs,Results,Waived,Waiver Data' > ${{ env.OUTPUT_NAME }}.csv
+           echo "trufflehog-results.hdf.json,Passed,Trufflehog/0000-0000,No findings at this time,This is a stub file generated due to a lack of results from trufflehog because zero issues were found.,,0,N/A,,,\"No fixes needed, good work.\",,,,FALSE," >> ${{ env.OUTPUT_NAME }}.csv
+         else
+           echo "Converting found results to CSV"
+           saf convert trufflehog2hdf -i ${{ env.OUTPUT_NAME }}.json -o ${{ env.OUTPUT_NAME }}.hdf.json
+           saf convert hdf2csv -i ${{ env.OUTPUT_NAME }}.hdf.json -o ${{ env.OUTPUT_NAME }}.csv
+         fi
+      -
+        name: Upload reports
+        if: success() || failure() # always run even if the previous step fails
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: trufflehog-results
+          path: |
+            ${{ env.OUTPUT_NAME }}.json
+            ${{ env.OUTPUT_NAME }}.hdf.json
+            ${{ env.OUTPUT_NAME }}.csv
+      -
+        name: Clone Reporting Repo
+        uses: GuillaumeFalourd/clone-github-repo-action@v2.3
+        with:
+          depth: 1
+          branch: 'main'
+          owner: ${{ secrets.GH_ACCT }}
+          repository: ${{ secrets.GH_REPO }}
+          access-token: ${{ secrets.INTERNAL_PAT }}
+      -
+        name: Create reporting repo if it doesn't exists.
+        run: |
+          if [[ ! -d ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/ ]]; then
+            echo "Project directory does not exist.  Creating."
+            mkdir -p ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/
+          else
+            echo "Project directory exists, happy day."
+          fi
+      -
+        name: Modify cloned repository content and commit
+        run: |
+          cp "./${{ env.OUTPUT_NAME }}.csv" "./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/${{ env.OUTPUT_NAME }}.csv"
+          cd ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}
+          git config --global user.email ${{ secrets.GH_EMAIL }}
+          git config --global user.name ${{ secrets.GH_NAME }}
+          git add "${{ env.OUTPUT_NAME }}.csv"
+          git pull
+          git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}" --dry-run > check.txt 2>&1 | true
+          if grep 'nothing added to commit' check.txt; then
+            rm check.txt
+            exit 0
+          else
+            rm check.txt
+            git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}"
+          fi
+      -
+        name: Push to Reporting Repo
+        run: |
+          cd ${{ secrets.GH_REPO }}
+          git remote set-url origin https://x-access-token:${{ secrets.INTERNAL_PAT }}@github.com/${{ secrets.GH_ACCT }}/${{ secrets.GH_REPO }}.git
+          git push
+
+  grype:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TOOL: "grype"
+      OUTPUT_NAME: "grype-results"
+    steps:
+      -
+        name: Install prerequisites
+        run: |
+          set -eu
+          sudo curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          sudo apt-get install -y npm
+          npm install -g "@mitre/saf@${{ env.MITRE_SAF_VERSION }}"
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3.5.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Grype scan
+        run: |
+          set -eu
+          grype ${{ env.IMAGE_NAME }} -o json  --file "${{ env.OUTPUT_NAME }}.json"
+      -
+        name: Check for results and make a stub if no vulnerabilities, otherwise process and make CSV.
+        run: |
+          set -eu
+          if grep -zoP '"matches":\[\],' ${{ env.OUTPUT_NAME }}.json; then
+            echo "NO FINDINGS, CREATING STUB"
+            echo 'Results Set,Status,ID,Title,Description,Descriptions,Impact,Severity,Code,Check,Fix,800-53 Controls,CCI IDs,Results,Waived,Waiver Data' > ${{ env.OUTPUT_NAME }}.csv
+            echo "grype-results.hdf.json,Passed,Grype/CVE-0000-0000,No findings at this time,This is a stub file generated due to a lack of results from grype because zero CVEs were found.,,0,N/A,,,\"No fixes needed, good work.\",,,,FALSE," >> ${{ env.OUTPUT_NAME }}.csv
+          else
+            echo "THERE ARE FINDINGS, GENERATING HDF AND CSV"
+            saf convert anchoregrype2hdf -i ${{ env.OUTPUT_NAME }}.json -o ${{ env.OUTPUT_NAME }}.hdf.json
+            saf convert hdf2csv -i ${{ env.OUTPUT_NAME }}.hdf.json -o ${{ env.OUTPUT_NAME }}.csv
+          fi
+      -
+        name: Upload reports
+        if: success() || failure() # always run even if the previous step fails
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: ${{ env.OUTPUT_NAME }}
+          path: |
+            ${{ env.OUTPUT_NAME }}.json
+            ${{ env.OUTPUT_NAME }}.hdf.json
+            ${{ env.OUTPUT_NAME }}.csv
+      -
+        name: Clone Reporting Repo
+        uses: GuillaumeFalourd/clone-github-repo-action@v2.3
+        with:
+          depth: 1
+          branch: 'main'
+          owner: ${{ secrets.GH_ACCT }}
+          repository: ${{ secrets.GH_REPO }}
+          access-token: ${{ secrets.INTERNAL_PAT }}
+      -
+        name: Create reporting repo if it doesn't exists.
+        run: |
+          ls -latr
+          ls -latr ./${{ secrets.GH_REPO }}/
+          if [[ ! -d ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/ ]]; then
+            echo "Project directory does not exist.  Creating."
+            mkdir -p ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/
+            ls -latr ./${{ secrets.GH_REPO }}/
+          else
+            echo "Project directory exists, happy day."
+          fi
+      -
+        name: Modify cloned repository content and commit
+        run: |
+          cp "./${{ env.OUTPUT_NAME }}.csv" "./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/${{ env.OUTPUT_NAME }}.csv"
+          cd ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}
+          git config --global user.email ${{ secrets.GH_EMAIL }}
+          git config --global user.name ${{ secrets.GH_NAME }}
+          git add "${{ env.OUTPUT_NAME }}.csv"
+          git pull
+          git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}" --dry-run > check.txt 2>&1 | true
+          if grep 'nothing added to commit' check.txt; then
+            rm check.txt
+            exit 0
+          else
+            rm check.txt
+            git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}"
+          fi
+      -
+        name: Push to Reporting Repo
+        run: |
+          cd ${{ secrets.GH_REPO }}
+          git remote set-url origin https://x-access-token:${{ secrets.INTERNAL_PAT }}@github.com/${{ secrets.GH_ACCT }}/${{ secrets.GH_REPO }}.git
+          git push
+
+  trivy:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TOOL: "trivy"
+      OUTPUT_NAME: "trivy-results"
+    steps:
+      -
+        name: Set up apt repo for prerequisites
+        run: |
+          set -eu
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+      -
+        name: Install prerequisites
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y npm trivy
+          npm install -g "@mitre/saf@${{ env.MITRE_SAF_VERSION }}"
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3.5.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Scan image
+        run: |
+          n=0
+          until [ "$n" -ge 10 ]
+          do
+            trivy image ${{ env.IMAGE_NAME }} --format template --template '@/usr/local/share/trivy/templates/asff.tpl' -o '${{ env.OUTPUT_NAME }}.json' && break
+            n=$((n+1))
+            sleep 15
+          done
+          if [ "$n" -eq 10 ]; then
+            echo "TRIVY FAILED"
+          fi
+
+      # OKAY SO WE NEED TO TEST FOR WHEN WE HAVE ZERO RESULTS IN THE TRIVY FILE BECAUSE THAT IS A THING THAT HAPPENS.
+      # Because the response for zero results is extremely well defined, this means we can use if/else logic to determine our path forward.
+      # We will first test for the case of zero vulnerabilities; if the file doesn't come back with zero vulns, we move forward with conversion.
+      -
+        name: Test results and either create a stub file or convert them.
+        run: |
+          set -eu
+          cat ${{ env.OUTPUT_NAME }}.json
+          if grep -zoP '...."Findings": \[\n*....\]\n' ${{ env.OUTPUT_NAME }}.json; then
+            echo "NO FINDINGS, CREATING STUB"
+            echo 'Results Set,Status,ID,Title,Description,Descriptions,Impact,Severity,Code,Check,Fix,800-53 Controls,CCI IDs,Results,Waived,Waiver Data' > ${{ env.OUTPUT_NAME }}.csv
+            echo "trivy-results.hdf.json,Passed,Trivy/CVE-0000-0000,No findings at this time,This is a stub file generated due to a lack of results from trivy because zero CVEs were found.,,0,N/A,,,\"No fixes needed, good work.\",,,,FALSE," >> ${{ env.OUTPUT_NAME }}.csv
+          else
+            echo "THERE ARE FINDINGS, GENERATING HDF AND CSV"
+            saf convert trivy2hdf -i ${{ env.OUTPUT_NAME }}.json -o ${{ env.OUTPUT_NAME }}
+            cp '${{ github.workspace }}/${{ env.OUTPUT_NAME }}/aquasecurity - aquasecurity.json' ${{ github.workspace }}/${{ env.OUTPUT_NAME }}.hdf.json
+            saf convert hdf2csv -i ${{ env.OUTPUT_NAME }}.hdf.json -o ${{ env.OUTPUT_NAME }}.csv
+          fi
+      -
+        name: Upload reports
+        if: success() || failure() # always run even if the previous step fails
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: trivy-results
+          path: |
+            ${{ env.OUTPUT_NAME }}.json
+            ${{ env.OUTPUT_NAME }}.hdf.json
+            ${{ env.OUTPUT_NAME }}.csv
+      -
+        name: Clone Reporting Repo
+        uses: GuillaumeFalourd/clone-github-repo-action@v2.3
+        with:
+          depth: 1
+          branch: 'main'
+          owner: ${{ secrets.GH_ACCT }}
+          repository: ${{ secrets.GH_REPO }}
+          access-token: ${{ secrets.INTERNAL_PAT }}
+      -
+        name: Create reporting repo if it doesn't exists.
+        run: |
+          if [[ ! -d ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/ ]]; then
+            echo "Project directory does not exist.  Creating."
+            mkdir -p ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/
+            ls -latr ./${{ secrets.GH_REPO }}/
+          else
+            echo "Project directory exists, happy day."
+          fi
+      -
+        name: Modify cloned repository content and commit
+        run: |
+          cp "./${{ env.OUTPUT_NAME }}.csv" "./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/${{ env.OUTPUT_NAME }}.csv"
+          cd ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}
+          git config --global user.email ${{ secrets.GH_EMAIL }}
+          git config --global user.name ${{ secrets.GH_NAME }}
+          git add "${{ env.OUTPUT_NAME }}.csv"
+          git pull
+          git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}" --dry-run > check.txt 2>&1 | true
+          if grep 'nothing added to commit' check.txt; then
+            rm check.txt
+            exit 0
+          else
+            rm check.txt
+            git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}"
+          fi
+      -
+        name: Push to Reporting Repo
+        run: |
+          cd ${{ secrets.GH_REPO }}
+          git remote set-url origin https://x-access-token:${{ secrets.INTERNAL_PAT }}@github.com/${{ secrets.GH_ACCT }}/${{ secrets.GH_REPO }}.git
+          git push
+
+  clam:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      EXPORT_NAME: "build.tar"
+      DIR_NAME: "build"
+      TOOL: "clamav"
+      OUTPUT_NAME: "clamav-results"
+    steps:
+      -
+        name: Start ClamAV daemon
+        uses: toblux/start-clamd-github-action@v0.2.1
+        with:
+          db_main: 'true'
+          db_daily: 'true'
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3.5.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Create, export, then extract to the filesystem
+        run: |
+          set -eu
+          mkdir -p ${{ env.DIR_NAME }}
+          CONT_ID=$(docker create ${{ env.IMAGE_NAME }})
+          docker export ${CONT_ID} -o ${{ env.EXPORT_NAME }}
+          tar --exclude='dev/null' --exclude='dev/random' --exclude='dev/urandom' --exclude='dev/zero' -xvf ${{ env.EXPORT_NAME }} -C ${{ github.workspace }}/${{ env.DIR_NAME }}
+      -
+        name: Scan using ClamAV to ensure no malware in static images
+        run: |
+          clamscan -ir  ${{ github.workspace }}/${{ env.DIR_NAME }} | tail -n 11 > ${{ env.OUTPUT_NAME }}.txt
+      -
+        name: Create CSV from results
+        run: |
+          echo "Engine Version,Known Viruses,Scanned Directories,Scanned Files,Infected Files" > ${{ env.OUTPUT_NAME }}.csv
+          {
+          cat ${{ env.OUTPUT_NAME }}.txt | grep "Engine version:" | sed "s/[[:blank:]]//g" | cut -d: -f2 | tr -d "\n\r"; echo -n ","
+          cat ${{ env.OUTPUT_NAME }}.txt | grep "Known viruses:" | sed "s/[[:blank:]]//g" | cut -d: -f2 | tr -d "\n\r"; echo -n ",";
+          cat ${{ env.OUTPUT_NAME }}.txt | grep "Scanned directories:" | sed "s/[[:blank:]]//g" | cut -d: -f2 | tr -d "\n\r"; echo -n ",";
+          cat ${{ env.OUTPUT_NAME }}.txt | grep "Scanned files:" | sed "s/[[:blank:]]//g" | cut -d: -f2 | tr -d "\n\r"; echo -n ",";
+          cat ${{ env.OUTPUT_NAME }}.txt | grep "Infected files:" | sed "s/[[:blank:]]//g" | cut -d: -f2 | tr -d "\n\r"
+          } >> ${{ env.OUTPUT_NAME }}.csv
+      -
+        name: Upload reports
+        if: success() || failure() # always run even if the previous step fails
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: clamd-results
+          path: |
+            ${{ env.OUTPUT_NAME }}.txt
+            ${{ env.OUTPUT_NAME }}.csv
+      -
+        name: Clone Reporting Repo
+        uses: GuillaumeFalourd/clone-github-repo-action@v2.3
+        with:
+          depth: 1
+          branch: 'main'
+          owner: ${{ secrets.GH_ACCT }}
+          repository: ${{ secrets.GH_REPO }}
+          access-token: ${{ secrets.INTERNAL_PAT }}
+      -
+        name: Create reporting repo if it doesn't exists.
+        run: |
+          if [[ ! -d ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/ ]]; then
+            echo "Project directory does not exist.  Creating."
+            mkdir -p ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/
+            ls -latr ./${{ secrets.GH_REPO }}/
+          else
+            echo "Project directory exists, happy day."
+          fi
+      -
+        name: Modify cloned repository content and commit
+        run: |
+          cp "./${{ env.OUTPUT_NAME }}.csv" "./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}/${{ env.OUTPUT_NAME }}.csv"
+          cd ./${{ secrets.GH_REPO }}/${{ github.event.repository.name }}
+          git config --global user.email ${{ secrets.GH_EMAIL }}
+          git config --global user.name ${{ secrets.GH_NAME }}
+          git add "${{ env.OUTPUT_NAME }}.csv"
+          git pull
+          git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}" --dry-run > check.txt 2>&1 | true
+          if grep 'nothing added to commit' check.txt; then
+            rm check.txt
+            exit 0
+          else
+            rm check.txt
+            git commit -m "Update ${{ env.TOOL }} results in ${{ github.event.repository.name }}"
+          fi
+      -
+        name: Push to Reporting Repo
+        run: |
+          cd ${{ secrets.GH_REPO }}
+          git remote set-url origin https://x-access-token:${{ secrets.INTERNAL_PAT }}@github.com/${{ secrets.GH_ACCT }}/${{ secrets.GH_REPO }}.git
+          git push
