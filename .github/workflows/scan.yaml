@@ -1,5 +1,4 @@
-name: daily-build-and-scan
-
+name: on-commit-build-and-scan
 on:
   push:
     branches:
