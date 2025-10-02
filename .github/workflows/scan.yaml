@@ -41,6 +41,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   scap:
+    # This code is derived from the following article by Craig Andrews-
+    # https://candrews.integralblue.com/2023/09/scap-security-and-compliance-scanning-of-docker-images-in-github-actions-and-gitlab-ci/
+    # This code is expressly under CC-BY-SA.
+    # See https://creativecommons.org/licenses/by-sa/4.0/ for more info.
     needs: build
     runs-on: ubuntu-latest
     container:
